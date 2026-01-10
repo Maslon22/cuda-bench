@@ -1,25 +1,38 @@
 #pragma once
 #include <cmath>
+#include <complex>
 
-double abs_error(double a,double b){ return std::abs(a-b); }
-double rel_error(double a,double b){ return std::abs(a-b)/(std::abs(a)+1e-12); }
-
-double rmse(const double* r,const double* t,int n){
-    double s=0;
-    for(int i=0;i<n;i++){ double d=r[i]-t[i]; s+=d*d; }
-    return std::sqrt(s/n);
+// ===================== RMSE (real) =====================
+template <typename T>
+double rmse(const T* a, const T* b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = double(a[i]) - double(b[i]);
+        s += d * d;
+    }
+    return std::sqrt(s / n);
 }
 
-inline double rmse_complex(
-    const std::complex<double>* a,
-    const std::complex<double>* b,
-    int n
-) {
-    double sum = 0.0;
+// ===================== RMSE (complex) =====================
+template <typename T>
+double rmse_complex(const std::complex<T>* a,
+                    const std::complex<T>* b,
+                    int n) {
+    double s = 0.0;
     for (int i = 0; i < n; i++) {
-        double dr = a[i].real() - b[i].real();
-        double di = a[i].imag() - b[i].imag();
-        sum += dr*dr + di*di;
+        double dr = double(a[i].real()) - double(b[i].real());
+        double di = double(a[i].imag()) - double(b[i].imag());
+        s += dr * dr + di * di;
     }
-    return std::sqrt(sum / n);
+    return std::sqrt(s / n);
+}
+
+// ===================== ABS ERROR =====================
+inline double abs_error(double ref, double val) {
+    return std::abs(ref - val);
+}
+
+// ===================== REL ERROR =====================
+inline double rel_error(double ref, double val) {
+    return std::abs(ref - val) / std::abs(ref);
 }

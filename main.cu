@@ -2,8 +2,10 @@
 #include <vector>
 #include <cmath>
 #include <complex>
-#include <cstring>
-
+#include <algorithm>
+#include <random>
+#include "common/precision.hpp"
+#include "gpu/montecarlo.cuh"
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <curand_kernel.h>
@@ -12,313 +14,321 @@
 #include "common/csv.hpp"
 #include "common/error_metrics.hpp"
 
-// ===================== CPU =====================
-void matmul_cpu(const float*, const float*, float*, int);
-void matmul_cpu_blocked(const float*, const float*, float*, int);
-double montecarlo_cpu(int);
-void dft_cpu(const std::complex<double>*, std::complex<double>*, int);
-void conv2d_cpu(const float*, float*, const float*, int, int);
 
-// ===================== GPU =====================
-__global__ void matmul_naive(const float*, const float*, float*, int);
-__global__ void matmul_tiled(const float*, const float*, float*, int);
+template <typename T>
+void fill_random(std::vector<T>& v, unsigned seed = 0) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+    for (auto& x : v)
+        x = static_cast<T>(dist(gen));
+}
+
+template <typename T>
+void fill_random_complex(std::vector<std::complex<T>>& v, unsigned seed = 0) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+    for (auto& x : v)
+        x = std::complex<T>(
+            static_cast<T>(dist(gen)),
+            static_cast<T>(dist(gen))
+        );
+}
+// ============================================================
+// =================== PRECYZJA ================================
+// ============================================================
+
+#if defined(USE_FP32)
+    #define CUFFT_EXEC cufftExecC2C
+    #define CUFFT_TYPE CUFFT_C2C
+    using cufft_complex = cufftComplex;
+    constexpr const char* PREC = "float";
+#elif defined(USE_FP64)
+    #define CUFFT_EXEC cufftExecZ2Z
+    #define CUFFT_TYPE CUFFT_Z2Z
+    using cufft_complex = cufftDoubleComplex;
+    constexpr const char* PREC = "double";
+#else
+    #error "Define USE_FP32 or USE_FP64"
+#endif
+
+// ============================================================
+// ===================== CPU =================================
+// ============================================================
+
+void matmul_cpu(const real*, const real*, real*, int);
+void matmul_cpu_blocked(const real*, const real*, real*, int);
+real montecarlo_cpu(int);
+void dft_cpu(const complex_t*, complex_t*, int);
+void conv2d_cpu(const real*, real*, const real*, int, int);
+
+// ============================================================
+// ===================== GPU =================================
+// ============================================================
+
+__global__ void matmul_naive(const real*, const real*, real*, int);
+__global__ void matmul_tiled(const real*, const real*, real*, int);
 __global__ void init(curandState*, int);
 __global__ void monte(curandState*, int*, int);
-__global__ void conv2d(const float*, float*, const float*, int, int);
+__global__ void conv2d(const real*, real*, const real*, int, int);
 
-// ===================== HELPERS =====================
-void check(cudaError_t e) {
+// ============================================================
+
+inline void check(cudaError_t e) {
     if (e != cudaSuccess) {
         std::cerr << "CUDA ERROR: " << cudaGetErrorString(e) << "\n";
-        exit(1);
+        std::exit(1);
     }
 }
 
-double rmse(const float* a, const float* b, int n){
-    double s=0;
-    for(int i=0;i<n;i++){
-        double d = double(a[i]) - double(b[i]);
-        s += d*d;
-    }
-    return std::sqrt(s/n);
-}
+// ============================================================
+// ===================== MAIN =================================
+// ============================================================
 
-// =================================================
-// ===================== MAIN ======================
-// =================================================
 int main() {
 
-    // =================================================
-    // MATRIX MULTIPLICATION
-    // =================================================
+    // ============================================================
+    // ================= MATRIX MULTIPLICATION ===================
+    // ============================================================
+
     csv_header("results_matmul.csv");
-    std::vector<int> mat_sizes = {128, 256, 512, 1024};
+    std::vector<int> sizes = {256, 512, 1024, 2048};
 
-    for (int N : mat_sizes) {
-    size_t bytes = N*N*sizeof(float);
+    for (int N : sizes) {
+        size_t bytes = N * N * sizeof(real);
 
-    std::vector<float> A(N*N, 1.0f);
-    std::vector<float> B(N*N, 1.0f);
+        std::vector<real> A(N*N);
+        std::vector<real> B(N*N);
 
-    std::vector<float> Ccpu_naive(N*N);
-    std::vector<float> Ccpu_blocked(N*N);
-    std::vector<float> Cgpu(N*N);
+        fill_random(A, 0);
+        fill_random(B, 1);
 
-    CpuTimer tc;
+        std::vector<real> Ccpu1(N*N), Ccpu2(N*N), Cgpu(N*N);
 
-    // CPU naive
-    tc.tic();
-    matmul_cpu(A.data(), B.data(), Ccpu_naive.data(), N);
-    double t_cpu_naive = tc.toc();
+        CpuTimer tc;
 
-    // CPU blocked
-    tc.tic();
-    matmul_cpu_blocked(A.data(), B.data(), Ccpu_blocked.data(), N);
-    double t_cpu_blocked = tc.toc();
+        tc.tic();
+        matmul_cpu(A.data(), B.data(), Ccpu1.data(), N);
+        double t_cpu_naive = tc.toc();
 
-    float *dA,*dB,*dC;
-    check(cudaMalloc(&dA,bytes));
-    check(cudaMalloc(&dB,bytes));
-    check(cudaMalloc(&dC,bytes));
+        tc.tic();
+        matmul_cpu_blocked(A.data(), B.data(), Ccpu2.data(), N);
+        double t_cpu_blocked = tc.toc();
 
-    check(cudaMemcpy(dA,A.data(),bytes,cudaMemcpyHostToDevice));
-    check(cudaMemcpy(dB,B.data(),bytes,cudaMemcpyHostToDevice));
+        double t_cpu_ref = std::min(t_cpu_naive, t_cpu_blocked);
 
-    dim3 block(16,16);
-    dim3 grid((N+15)/16,(N+15)/16);
+        real *dA,*dB,*dC;
+        check(cudaMalloc(&dA,bytes));
+        check(cudaMalloc(&dB,bytes));
+        check(cudaMalloc(&dC,bytes));
 
-    GpuTimer tg;
+        check(cudaMemcpy(dA,A.data(),bytes,cudaMemcpyHostToDevice));
+        check(cudaMemcpy(dB,B.data(),bytes,cudaMemcpyHostToDevice));
 
-    // GPU naive
-    tg.tic();
-    matmul_naive<<<grid,block>>>(dA,dB,dC,N);
-    check(cudaDeviceSynchronize());
-    double t_gpu_naive = tg.toc();
+        dim3 block(16,16);
+        dim3 grid((N+15)/16,(N+15)/16);
 
-    check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
-    double err_naive = rmse(Ccpu_naive.data(), Cgpu.data(), N*N);
+        GpuTimer tg;
 
-    // GPU tiled
-    tg.tic();
-    matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
-    check(cudaDeviceSynchronize());
-    double t_gpu_tiled = tg.toc();
+        tg.tic();
+        matmul_naive<<<grid,block>>>(dA,dB,dC,N);
+        check(cudaDeviceSynchronize());
+        double t_gpu_naive = tg.toc();
 
-    check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
-    double err_tiled = rmse(Ccpu_naive.data(), Cgpu.data(), N*N);
+        check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
+        double err_naive = rmse(Ccpu2.data(), Cgpu.data(), N*N);
 
-    double flops = 2.0 * N * N * N;
+        tg.tic();
+        matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
+        check(cudaDeviceSynchronize());
+        double t_gpu_tiled = tg.toc();
 
-    csv_add("results_matmul.csv","matmul","naive","CPU","float",N,
-            t_cpu_naive, flops/(t_cpu_naive*1e6), 1.0, 0,0,0);
+        check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
+        double err_tiled = rmse(Ccpu2.data(), Cgpu.data(), N*N);
 
-    csv_add("results_matmul.csv","matmul","blocked","CPU","float",N,
-            t_cpu_blocked, flops/(t_cpu_blocked*1e6),
-            t_cpu_naive/t_cpu_blocked, 0,0,0);
+        double flops = 2.0 * N * N * N;
 
-    csv_add("results_matmul.csv","matmul","naive","GPU","float",N,
-            t_gpu_naive, flops/(t_gpu_naive*1e6),
-            t_cpu_naive/t_gpu_naive, err_naive,0,0);
+        csv_add("results_matmul.csv","matmul","naive","CPU",PREC,N,
+                t_cpu_naive, flops/(t_cpu_naive*1e6), 1.0, 0,0,0);
 
-    csv_add("results_matmul.csv","matmul","tiled","GPU","float",N,
-            t_gpu_tiled, flops/(t_gpu_tiled*1e6),
-            t_cpu_naive/t_gpu_tiled, err_tiled,0,0);
+        csv_add("results_matmul.csv","matmul","blocked","CPU",PREC,N,
+                t_cpu_blocked, flops/(t_cpu_blocked*1e6),
+                t_cpu_naive/t_cpu_blocked, 0,0,0);
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-}
+        csv_add("results_matmul.csv","matmul","naive","GPU",PREC,N,
+                t_gpu_naive, flops/(t_gpu_naive*1e6),
+                t_cpu_ref/t_gpu_naive, err_naive,0,0);
 
-    // =================================================
-    // MONTE CARLO
-    // =================================================
+        csv_add("results_matmul.csv","matmul","tiled","GPU",PREC,N,
+                t_gpu_tiled, flops/(t_gpu_tiled*1e6),
+                t_cpu_ref/t_gpu_tiled, err_tiled,0,0);
+
+        cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    }
+
+    // ============================================================
+    // ================= MONTE CARLO ==============================
+    // ============================================================
+
     csv_header("results_montecarlo.csv");
     std::vector<int> mc_sizes = {
-    int(1e6),
-    int(5e6),
-    int(1e7),
-    int(5e7)
-    };
+    int(1e6), int(5e6), int(1e7), int(5e7)
+};
+
 
     for (int N : mc_sizes) {
+
         CpuTimer tc;
         tc.tic();
-        double pi_cpu = montecarlo_cpu(N);
+        real pi_cpu = montecarlo_cpu(N);
         double t_cpu = tc.toc();
 
         double thr_cpu = N / t_cpu;
 
-        curandState* states;
-        int* d_in;
-        int h_in = 0;
+        curandStatePhilox4_32_10_t* d_states;
+        unsigned long long* d_inside;
+        unsigned long long h_inside = 0;
 
-        check(cudaMalloc(&states,N*sizeof(curandState)));
-        check(cudaMalloc(&d_in,sizeof(int)));
-        check(cudaMemcpy(d_in,&h_in,sizeof(int),cudaMemcpyHostToDevice));
+        cudaMalloc(&d_states, N * sizeof(curandStatePhilox4_32_10_t));
+        cudaMalloc(&d_inside, sizeof(unsigned long long));
+        cudaMemcpy(d_inside, &h_inside, sizeof(h_inside), cudaMemcpyHostToDevice);
 
-        init<<<(N+255)/256,256>>>(states,N);
+        init_rng<<<(N+255)/256,256>>>(d_states, N);
 
         GpuTimer tg;
         tg.tic();
-         monte<<<(N+255)/256,256>>>(states,d_in,N);
+        montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
         cudaDeviceSynchronize();
         double t_gpu = tg.toc();
 
-        double thr_gpu = N / t_gpu;
+        cudaMemcpy(&h_inside, d_inside, sizeof(h_inside), cudaMemcpyDeviceToHost);
 
-        check(cudaMemcpy(&h_in,d_in,sizeof(int),cudaMemcpyDeviceToHost));
-        double pi_gpu = 4.0 * h_in / N;
+        real pi_gpu = real(4) * h_inside / N;
+
         double abs = abs_error(pi_cpu, pi_gpu);
         double rel = rel_error(pi_cpu, pi_gpu);
 
-        csv_add("results_montecarlo.csv",
-            "montecarlo","pi","CPU","double",N,
-            t_cpu, thr_cpu, 1.0, 0, abs, rel);
+        csv_add("results_montecarlo.csv","montecarlo","pi","CPU",PREC,
+                N, t_cpu, thr_cpu, 1.0, 0, abs, rel);
 
-        csv_add("results_montecarlo.csv",
-            "montecarlo","pi","GPU","double",N,
-            t_gpu, thr_gpu, t_cpu/t_gpu, 0, abs, rel);
+        csv_add("results_montecarlo.csv","montecarlo","pi","GPU",PREC,
+                N, t_gpu, N/t_gpu, t_cpu/t_gpu, 0, abs, rel);
 
-        cudaFree(states); cudaFree(d_in);
+        cudaFree(d_states);
+        cudaFree(d_inside);
     }
 
-    // =================================================
-    // FFT
-    // =================================================
-    csv_header("results_fft.csv");
+    // ============================================================
+    // ================= FFT =====================================
+    // ============================================================
 
-    std::vector<int> fft_sizes = {256, 512, 1024, 2048};
+    csv_header("results_fft.csv");
+    std::vector<int> fft_sizes = {512, 1024, 2048, 4096};
 
     for (int N : fft_sizes) {
 
-        // ======== INPUT ========
-        std::vector<std::complex<double>> in(N);
-        std::vector<std::complex<double>> out_cpu(N);
-        std::vector<std::complex<double>> out_gpu(N);
+        std::vector<complex_t> in(N), out_cpu(N), out_gpu(N);
+        fill_random_complex(in, 0);
 
-        for (int i = 0; i < N; i++)
-            in[i] = { double(i), 0.0 };
-
-        // ======== CPU: DFT ========
         CpuTimer tc;
         tc.tic();
         dft_cpu(in.data(), out_cpu.data(), N);
         double t_cpu = tc.toc();
 
-        // ======== GPU: cuFFT ========
-        cufftDoubleComplex* d_fft;
-        check(cudaMalloc(&d_fft, N * sizeof(cufftDoubleComplex)));
-        check(cudaMemcpy(
-            d_fft,
-            in.data(),
-            N * sizeof(cufftDoubleComplex),
-            cudaMemcpyHostToDevice
-        ));
+        cufft_complex* d_fft;
+        check(cudaMalloc(&d_fft, N*sizeof(cufft_complex)));
+        check(cudaMemcpy(d_fft, in.data(), N*sizeof(cufft_complex),
+                         cudaMemcpyHostToDevice));
 
         cufftHandle plan;
-        cufftPlan1d(&plan, N, CUFFT_Z2Z, 1);
+        cufftPlan1d(&plan, N, CUFFT_TYPE, 1);
 
         GpuTimer tg;
         tg.tic();
-        cufftExecZ2Z(plan, d_fft, d_fft, CUFFT_FORWARD);
+        CUFFT_EXEC(plan, d_fft, d_fft, CUFFT_FORWARD);
         check(cudaDeviceSynchronize());
         double t_gpu = tg.toc();
 
-        // ======== COPY BACK ========
-        std::vector<cufftDoubleComplex> h_fft(N);
-        check(cudaMemcpy(
-            h_fft.data(),
-            d_fft,
-            N * sizeof(cufftDoubleComplex),
-            cudaMemcpyDeviceToHost
-        ));
+        check(cudaMemcpy(out_gpu.data(), d_fft,
+                         N*sizeof(complex_t),
+                         cudaMemcpyDeviceToHost));
 
-        for (int i = 0; i < N; i++) {
-            out_gpu[i] = {
-                h_fft[i].x,
-                h_fft[i].y
-            };
-        }
+        double flops = 5.0 * N * std::log2(double(N));
+        double rmse_fft = rmse_complex(out_cpu.data(), out_gpu.data(), N);
 
-        // ======== METRICS ========
-        double flops = 5.0 * N * std::log2((double)N);
-        double gflops_cpu = flops / (t_cpu * 1e6);
-        double gflops_gpu = flops / (t_gpu * 1e6);
-        double speedup = t_cpu / t_gpu;
-        double rmse_fft = rmse_complex(
-            out_cpu.data(),
-            out_gpu.data(),
-            N
-        );
+        csv_add("results_fft.csv","fft","dft","CPU",PREC,
+                N, t_cpu, flops/(t_cpu*1e6), 1.0, 0,0,0);
 
-        // ======== CSV ========
-        csv_add(
-            "results_fft.csv",
-            "fft", "dft", "CPU", "double", N,
-            t_cpu, gflops_cpu, 1.0,
-            0.0, 0.0, 0.0
-        );
+        csv_add("results_fft.csv","fft","cufft","GPU",PREC,
+                N, t_gpu, flops/(t_gpu*1e6),
+                t_cpu/t_gpu, rmse_fft,0,0);
 
-        csv_add(
-            "results_fft.csv",
-            "fft", "cufft", "GPU", "double", N,
-            t_gpu, gflops_gpu, speedup,
-            rmse_fft, 0.0, 0.0
-        );
-
-        // ======== CLEANUP ========
         cufftDestroy(plan);
         cudaFree(d_fft);
     }
 
-    // =================================================
-    // CONVOLUTION
-    // =================================================
+    // ============================================================
+    // ================= CONV2D ==================================
+    // ============================================================
+
     csv_header("results_conv2d.csv");
-    std::vector<int> conv_sizes = {512, 1024, 2048};
+    std::vector<int> conv_sizes = {512, 1024, 2048, 4096};
+
 
     for (int S : conv_sizes) {
-        int W=S,H=S;
-        size_t bytes=W*H*sizeof(float);
+        size_t bytes = S*S*sizeof(real);
 
-        std::vector<float> img(W*H,1.0f), out_cpu(W*H), out_gpu(W*H);
-        float kernel[9]={1,1,1,1,1,1,1,1,1};
+        std::vector<real> img(S*S);
+        fill_random(img, 0);
+
+        real kernel[9];
+        {
+            std::mt19937 gen(123);
+            std::uniform_real_distribution<double> d(-1.0, 1.0);
+            for (int i = 0; i < 9; i++)
+                kernel[i] = static_cast<real>(d(gen));
+        }
+
+        std::vector<real> out_cpu(S*S), out_gpu(S*S);
 
         CpuTimer tc;
         tc.tic();
-        conv2d_cpu(img.data(),out_cpu.data(),kernel,W,H);
+        conv2d_cpu(img.data(), out_cpu.data(), kernel, S, S);
         double t_cpu = tc.toc();
 
-        float *dI,*dO,*dK;
+        real *dI,*dO,*dK;
         check(cudaMalloc(&dI,bytes));
         check(cudaMalloc(&dO,bytes));
-        check(cudaMalloc(&dK,9*sizeof(float)));
+        check(cudaMalloc(&dK,9*sizeof(real)));
 
         check(cudaMemcpy(dI,img.data(),bytes,cudaMemcpyHostToDevice));
-        check(cudaMemcpy(dK,kernel,9*sizeof(float),cudaMemcpyHostToDevice));
+        check(cudaMemcpy(dK,kernel,9*sizeof(real),cudaMemcpyHostToDevice));
 
         dim3 block(16,16);
-        dim3 grid((W+15)/16,(H+15)/16);
+        dim3 grid((S+15)/16,(S+15)/16);
 
         GpuTimer tg;
         tg.tic();
-        conv2d<<<grid,block>>>(dI,dO,dK,W,H);
+        conv2d<<<grid,block>>>(dI,dO,dK,S,S);
         check(cudaDeviceSynchronize());
         double t_gpu = tg.toc();
-        double flops = W * H * 9 * 2;
-        double gflops_cpu = flops / (t_cpu * 1e6);
-        double gflops_gpu = flops / (t_gpu * 1e6);
-        double rmse_conv = rmse(out_cpu.data(), out_gpu.data(), W*H);
 
-        csv_add("results_conv2d.csv",
-            "conv2d","3x3","CPU","float",W,
-            t_cpu, gflops_cpu, 1.0, 0,0,0);
+        check(cudaMemcpy(out_gpu.data(), dO, bytes, cudaMemcpyDeviceToHost));
 
-        csv_add("results_conv2d.csv",
-            "conv2d","3x3","GPU","float",W,
-            t_gpu, gflops_gpu, t_cpu/t_gpu, rmse_conv,0,0);
+        double flops = 2.0 * S * S * 9;
+        double rmse_c = rmse(out_cpu.data(), out_gpu.data(), S*S);
+
+        csv_add("results_conv2d.csv","conv2d","3x3","CPU",PREC,
+                S, t_cpu, flops/(t_cpu*1e6), 1.0, 0,0,0);
+
+        csv_add("results_conv2d.csv","conv2d","3x3","GPU",PREC,
+                S, t_gpu, flops/(t_gpu*1e6),
+                t_cpu/t_gpu, rmse_c,0,0);
 
         cudaFree(dI); cudaFree(dO); cudaFree(dK);
     }
 
-    std::cout << "ALL BENCHMARKS DONE\n";
+    std::cout << "BENCHMARK DONE (" << PREC << ")\n";
     return 0;
 }
