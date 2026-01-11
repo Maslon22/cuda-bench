@@ -15,9 +15,14 @@
 constexpr double PI = 3.141592653589793238462643383279502884;
 __global__ void matmul_naive(const real*, const real*, real*, int);
 __global__ void matmul_tiled(const real*, const real*, real*, int);
-__global__ void conv2d(const real*, real*, const real*, int, int);
+__global__ void conv2d(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
+__global__ void conv2d_shared(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
 __global__ void init(curandState*, int);
 __global__ void monte(curandState*, int*, int);
+__global__ void reset_counter(unsigned long long* x){
+    if(threadIdx.x == 0 && blockIdx.x == 0)
+        *x = 0ULL;
+}
 
 // ===================== PRECISION =====================
 #if defined(USE_FP32)
@@ -90,33 +95,36 @@ int main() {
         dim3 block(16,16);
         dim3 grid((N+15)/16,(N+15)/16);
 
+        matmul_naive<<<grid,block>>>(dA,dB,dC,N);
+        cudaDeviceSynchronize();
+
         GpuTimer tg;
-
-        // --- NAIVE ---
         tg.tic();
-        for(int i=0;i<5;i++)
+        for(int i=0;i<10;i++)
             matmul_naive<<<grid,block>>>(dA,dB,dC,N);
-        check(cudaDeviceSynchronize());
-        double t = tg.toc()/5.0;
+        cudaDeviceSynchronize(); 
+        double t_n = tg.toc() / 10;
 
-        double gflops = (2.0 * N * N * N) / (t * 1e6);
+        double gflops = (2.0 * N * N * N) / (t_n * 1e6);
 
         csv_add("results_gpu_matmul.csv",
                 "matmul","naive",gpu,PREC,
-                N,t,gflops,0,0,0,0);
+                N,t_n,gflops,0,0,0,0);
 
-        // --- TILED ---
+        matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
+        cudaDeviceSynchronize();
+
         tg.tic();
-        for(int i=0;i<5;i++)
+        for(int i=0;i<10;i++)
             matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
-        check(cudaDeviceSynchronize());
-        t = tg.toc()/5.0;
+        cudaDeviceSynchronize(); 
+        double t_t = tg.toc() / 10;
 
-        gflops = (2.0 * N * N * N) / (t * 1e6);
+        gflops = (2.0 * N * N * N) / (t_t * 1e6);
 
         csv_add("results_gpu_matmul.csv",
                 "matmul","tiled",gpu,PREC,
-                N,t,gflops,0,0,0,0);
+                N,t_t,gflops,0,0,0,0);
 
         cudaFree(dA); cudaFree(dB); cudaFree(dC);
     }
@@ -134,12 +142,14 @@ int main() {
 
         cufftHandle plan;
         cufftPlan1d(&plan, N, CUFFT_TYPE, 1);
+        CUFFT_EXEC(plan, d, d, CUFFT_FORWARD);
+        cudaDeviceSynchronize();
 
         GpuTimer tg;
         tg.tic();
         for(int i=0;i<10;i++)
             CUFFT_EXEC(plan, d, d, CUFFT_FORWARD);
-        check(cudaDeviceSynchronize());
+        cudaDeviceSynchronize();
         double t = tg.toc()/10.0;
 
         double gflops = 5.0 * N * std::log2(double(N)) / (t * 1e6);
@@ -177,11 +187,17 @@ int main() {
 
         init_rng<<<grid, block>>>(d_states, N);
 
+        montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
+        cudaDeviceSynchronize();
+
         GpuTimer tg;
         tg.tic();
-        montecarlo_gpu<<<grid, block>>>(d_states, d_inside, N);
-        check(cudaDeviceSynchronize());
-        double t = tg.toc();
+        for(int i=0;i<5;i++){
+            reset_counter<<<1,1>>>(d_inside);
+            montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
+        }
+        cudaDeviceSynchronize();
+        double t = tg.toc()/5.0;
 
         check(cudaMemcpy(&h_inside, d_inside,
             sizeof(h_inside), cudaMemcpyDeviceToHost));
@@ -233,20 +249,36 @@ int main() {
 
         dim3 block(16,16);
         dim3 grid((S+15)/16,(S+15)/16);
+        cudaMemset(dO, 0, bytes);
+        conv2d<<<grid,block>>>(dI,dO,dK,S,S);
+        cudaDeviceSynchronize();
 
+        
         GpuTimer tg;
         tg.tic();
         for(int i=0;i<10;i++)
-            conv2d<<<grid,block>>>(dI,dO,dK,S,S);
-        check(cudaDeviceSynchronize());
-        double t = tg.toc()/10.0;
+            conv2d<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaDeviceSynchronize();
+        double t_gpu_naive = tg.toc()/10;
 
-        double gflops = (2.0 * S * S * 9) / (t * 1e6);
 
-        csv_add("results_gpu_conv2d.csv",
-                "conv2d","3x3",gpu,PREC,
-                S,t,gflops,0,0,0,0);
+        csv_add("results_gpu_conv2d.csv", "conv2d", "3x3_naive", "GPU", PREC,
+                S, t_gpu_naive, (2.0*S*S*9)/(t_gpu_naive*1e6),
+                0, 0, 0, 0);
+        conv2d_shared<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaMemset(dO, 0, bytes);
+        cudaDeviceSynchronize();
 
+        tg.tic();
+        for(int i=0;i<10;i++)
+            conv2d_shared<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaDeviceSynchronize();
+        double t_gpu_shared = tg.toc()/10;
+
+
+        csv_add("results_gpu_conv2d.csv", "conv2d", "3x3_shared", "GPU", PREC,
+                S, t_gpu_shared, (2.0*S*S*9)/(t_gpu_shared*1e6),
+                0, 0, 0, 0);
         cudaFree(dI); cudaFree(dO); cudaFree(dK);
     }
 

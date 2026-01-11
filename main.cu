@@ -71,7 +71,13 @@ __global__ void matmul_naive(const real*, const real*, real*, int);
 __global__ void matmul_tiled(const real*, const real*, real*, int);
 __global__ void init(curandState*, int);
 __global__ void monte(curandState*, int*, int);
-__global__ void conv2d(const real*, real*, const real*, int, int);
+__global__ void conv2d(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
+__global__ void conv2d_shared(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
+__global__ void reset_counter(unsigned long long* x){
+    if(threadIdx.x == 0 && blockIdx.x == 0)
+        *x = 0ULL;
+}
+
 
 // ============================================================
 
@@ -129,20 +135,27 @@ int main() {
         dim3 block(16,16);
         dim3 grid((N+15)/16,(N+15)/16);
 
-        GpuTimer tg;
-
-        tg.tic();
         matmul_naive<<<grid,block>>>(dA,dB,dC,N);
-        check(cudaDeviceSynchronize());
-        double t_gpu_naive = tg.toc();
+        cudaDeviceSynchronize();
+
+        GpuTimer tg;
+        tg.tic();
+        for(int i=0;i<10;i++)
+            matmul_naive<<<grid,block>>>(dA,dB,dC,N);
+        cudaDeviceSynchronize(); 
+        double t_gpu_naive = tg.toc() / 10;
 
         check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
         double err_naive = rmse(Ccpu2.data(), Cgpu.data(), N*N);
 
-        tg.tic();
         matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
-        check(cudaDeviceSynchronize());
-        double t_gpu_tiled = tg.toc();
+        cudaDeviceSynchronize();
+
+        tg.tic();
+        for(int i=0;i<10;i++)
+            matmul_tiled<<<grid,block>>>(dA,dB,dC,N);
+        cudaDeviceSynchronize(); 
+        double t_gpu_tiled = tg.toc() / 10;
 
         check(cudaMemcpy(Cgpu.data(),dC,bytes,cudaMemcpyDeviceToHost));
         double err_tiled = rmse(Ccpu2.data(), Cgpu.data(), N*N);
@@ -195,12 +208,17 @@ int main() {
         cudaMemcpy(d_inside, &h_inside, sizeof(h_inside), cudaMemcpyHostToDevice);
 
         init_rng<<<(N+255)/256,256>>>(d_states, N);
+        montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
+        cudaDeviceSynchronize();
 
         GpuTimer tg;
         tg.tic();
-        montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
+        for(int i=0;i<5;i++){
+            reset_counter<<<1,1>>>(d_inside);
+            montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
+        }
         cudaDeviceSynchronize();
-        double t_gpu = tg.toc();
+        double t_gpu = tg.toc()/5.0;
 
         cudaMemcpy(&h_inside, d_inside, sizeof(h_inside), cudaMemcpyDeviceToHost);
 
@@ -243,12 +261,15 @@ int main() {
 
         cufftHandle plan;
         cufftPlan1d(&plan, N, CUFFT_TYPE, 1);
+        CUFFT_EXEC(plan, d_fft, d_fft, CUFFT_FORWARD);
+        cudaDeviceSynchronize();
 
         GpuTimer tg;
         tg.tic();
-        CUFFT_EXEC(plan, d_fft, d_fft, CUFFT_FORWARD);
-        check(cudaDeviceSynchronize());
-        double t_gpu = tg.toc();
+        for(int i=0;i<10;i++)
+            CUFFT_EXEC(plan, d_fft, d_fft, CUFFT_FORWARD);
+        cudaDeviceSynchronize();
+        double t_gpu = tg.toc()/10.0;
 
         check(cudaMemcpy(out_gpu.data(), d_fft,
                          N*sizeof(complex_t),
@@ -305,27 +326,50 @@ int main() {
         check(cudaMemcpy(dI,img.data(),bytes,cudaMemcpyHostToDevice));
         check(cudaMemcpy(dK,kernel,9*sizeof(real),cudaMemcpyHostToDevice));
 
-        dim3 block(16,16);
-        dim3 grid((S+15)/16,(S+15)/16);
+        dim3 block(16, 16);
+        dim3 grid(
+            (S + block.x - 1) / block.x,
+            (S + block.y - 1) / block.y);
+        cudaMemset(dO, 0, bytes);
+        conv2d<<<grid,block>>>(dI,dO,dK,S,S);
+        cudaDeviceSynchronize();
 
+        
         GpuTimer tg;
         tg.tic();
-        conv2d<<<grid,block>>>(dI,dO,dK,S,S);
-        check(cudaDeviceSynchronize());
-        double t_gpu = tg.toc();
+        for(int i=0;i<10;i++)
+            conv2d<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaDeviceSynchronize();
+        double t_gpu_naive = tg.toc()/10;
 
         check(cudaMemcpy(out_gpu.data(), dO, bytes, cudaMemcpyDeviceToHost));
+        double rmse_naive = rmse(out_cpu.data(), out_gpu.data(), S*S);
 
-        double flops = 2.0 * S * S * 9;
-        double rmse_c = rmse(out_cpu.data(), out_gpu.data(), S*S);
+        csv_add("results_conv2d.csv", "conv2d", "3x3_naive", "GPU", PREC,
+                S, t_gpu_naive, (2.0*S*S*9)/(t_gpu_naive*1e6),
+                t_cpu/t_gpu_naive, rmse_naive, 0, 0);
+        conv2d_shared<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaMemset(dO, 0, bytes);
+        cudaDeviceSynchronize();
 
-        csv_add("results_conv2d.csv","conv2d","3x3","CPU",PREC,
-                S, t_cpu, flops/(t_cpu*1e6), 1.0, 0,0,0);
+        tg.tic();
+        for(int i=0;i<10;i++)
+            conv2d_shared<<<grid, block>>>(dI, dO, dK, S, S);
+        cudaDeviceSynchronize();
+        double t_gpu_shared = tg.toc()/10;
 
-        csv_add("results_conv2d.csv","conv2d","3x3","GPU",PREC,
-                S, t_gpu, flops/(t_gpu*1e6),
-                t_cpu/t_gpu, rmse_c,0,0);
+        check(cudaMemcpy(out_gpu.data(), dO, bytes, cudaMemcpyDeviceToHost));
+        double rmse_shared = rmse(out_cpu.data(), out_gpu.data(), S*S);
 
+        csv_add("results_conv2d.csv", "conv2d", "3x3_shared", "GPU", PREC,
+                S, t_gpu_shared, (2.0*S*S*9)/(t_gpu_shared*1e6),
+                t_cpu/t_gpu_shared, rmse_shared, 0, 0);
+
+        // ================= CPU CSV =================
+        csv_add("results_conv2d.csv", "conv2d", "3x3", "CPU", PREC,
+                S, t_cpu, (2.0*S*S*9)/(t_cpu*1e6), 1.0, 0, 0, 0);
+
+        // ================= Cleanup =================
         cudaFree(dI); cudaFree(dO); cudaFree(dK);
     }
 
