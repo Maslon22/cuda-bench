@@ -198,8 +198,8 @@ int main() {
         cudaDeviceSynchronize();
         double t = tg.toc();
         unsigned long long h_inside = 0;
-        check(cudaMemcpy(&h_inside, d_inside,
-            sizeof(h_inside), cudaMemcpyDeviceToHost));
+        cudaMemcpy(&h_inside, d_inside,
+            sizeof(h_inside), cudaMemcpyDeviceToHost);
 
         real pi = real(4) * h_inside / N;
 
@@ -283,5 +283,6 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
 
 
