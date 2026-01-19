@@ -196,7 +196,7 @@ int main() {
         unsigned long long h_inside = 0;
         cudaMemcpy(&h_inside, d_inside,
             sizeof(h_inside), cudaMemcpyDeviceToHost);
-        doube t = t_ms/repeats;
+        double t = t_ms/repeats;
         real pi = real(4) * h_inside / N;
         double time_s = t * 1e-3;
         double abs = std::abs(double(pi) - PI);
@@ -279,6 +279,7 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
 
 
 
