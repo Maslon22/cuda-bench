@@ -179,11 +179,7 @@ int main() {
         cudaMemset(d_inside, 0, sizeof(unsigned long long));
         
         dim3 block(256);
-        unsigned int grid_x =
-            (N + block.x - 1) / block.x;
-        if(grid_x > 1024) grid_x = 1024;
-        
-        dim3 grid(grid_x);
+        dim3 grid((N + block.x - 1) / block.x);
 
         
         size_t shmem = block.x * sizeof(unsigned int);
@@ -202,7 +198,7 @@ int main() {
             sizeof(h_inside), cudaMemcpyDeviceToHost);
 
         real pi = real(4) * h_inside / N;
-
+        double time_s = t * 1e-3;
         double abs = std::abs(double(pi) - PI);
         double rel = abs / PI;
 
@@ -211,7 +207,7 @@ int main() {
                 gpu_name(), PREC,
                 N,
                 t,
-                N / t,     // throughput
+                N / time_s,     // throughput
                 0,         // speedup (GPU-only)
                 0,         // rmse (brak referencji)
                 abs,
@@ -283,6 +279,7 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
 
 
 
