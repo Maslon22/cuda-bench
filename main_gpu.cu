@@ -172,32 +172,23 @@ int main() {
 
         curandStatePhilox4_32_10_t* d_states;
         unsigned long long* d_inside;
-        unsigned long long h_inside = 0;
-
-        check(cudaMalloc(&d_states,
-            N * sizeof(curandStatePhilox4_32_10_t)));
-        check(cudaMalloc(&d_inside,
-            sizeof(unsigned long long)));
-
-        check(cudaMemcpy(d_inside, &h_inside,
-            sizeof(h_inside), cudaMemcpyHostToDevice));
-
+        cudaMalloc(&d_inside, sizeof(unsigned long long));
+        cudaMemset(d_inside, 0, sizeof(unsigned long long));
+        
         dim3 block(256);
-        dim3 grid((N + block.x - 1) / block.x);
-
-        init_rng<<<grid, block>>>(d_states, N);
-
-        montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
-        cudaDeviceSynchronize();
-
+        dim3 grid(std::min(1024, (N + block.x - 1) / block.x));
+        
+        size_t shmem = block.x * sizeof(unsigned int);
+        
         GpuTimer tg;
         tg.tic();
-        for(int i=0;i<5;i++){
-            reset_counter<<<1,1>>>(d_inside);
-            montecarlo_gpu<<<(N+255)/256,256>>>(d_states, d_inside, N);
-        }
+        montecarlo_kernel<<<grid, block, shmem>>>(
+            d_inside,
+            123456ULL,
+            N
+        );
         cudaDeviceSynchronize();
-        double t = tg.toc()/5.0;
+        double t = tg.toc();
 
         check(cudaMemcpy(&h_inside, d_inside,
             sizeof(h_inside), cudaMemcpyDeviceToHost));
@@ -285,3 +276,4 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
