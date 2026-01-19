@@ -18,7 +18,11 @@ __global__ void matmul_tiled(const real*, const real*, real*, int);
 __global__ void conv2d(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
 __global__ void conv2d_shared(const real* __restrict__, real* __restrict__, const real* __restrict__, int, int);
 __global__ void init(curandState*, int);
-__global__ void monte(curandState*, int*, int);
+__global__ void montecarlo_kernel(
+    unsigned long long* global_inside,
+    unsigned long long seed,
+    int total_samples
+);
 __global__ void reset_counter(unsigned long long* x){
     if(threadIdx.x == 0 && blockIdx.x == 0)
         *x = 0ULL;
@@ -170,13 +174,17 @@ int main() {
 
     for (int N : mc_sizes) {
 
-        curandStatePhilox4_32_10_t* d_states;
         unsigned long long* d_inside;
         cudaMalloc(&d_inside, sizeof(unsigned long long));
         cudaMemset(d_inside, 0, sizeof(unsigned long long));
         
         dim3 block(256);
-        dim3 grid(std::min(1024, (N + block.x - 1) / block.x));
+        unsigned int grid_x =
+            (N + block.x - 1) / block.x;
+        if(grid_x > 1024) grid_x = 1024;
+        
+        dim3 grid(grid_x);
+
         
         size_t shmem = block.x * sizeof(unsigned int);
         
@@ -189,7 +197,7 @@ int main() {
         );
         cudaDeviceSynchronize();
         double t = tg.toc();
-
+        unsigned long long h_inside = 0;
         check(cudaMemcpy(&h_inside, d_inside,
             sizeof(h_inside), cudaMemcpyDeviceToHost));
 
@@ -209,7 +217,6 @@ int main() {
                 abs,
                 rel);
 
-        cudaFree(d_states);
         cudaFree(d_inside);
     }
 
@@ -276,4 +283,5 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
 
