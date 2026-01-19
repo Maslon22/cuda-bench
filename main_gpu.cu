@@ -185,12 +185,12 @@ int main() {
         size_t shmem = block.x * sizeof(unsigned int);
         
         GpuTimer tg;
+        int repeats = 1000;
+        cudaDeviceSynchronize();
         tg.tic();
-        montecarlo_kernel<<<grid, block, shmem>>>(
-            d_inside,
-            123456ULL,
-            N
-        );
+        for(int r = 0; r < repeats; r++){
+            montecarlo_kernel<<<grid, block, shmem>>>(d_inside, 123456ULL, N);
+        }
         cudaDeviceSynchronize();
         double t = tg.toc();
         unsigned long long h_inside = 0;
@@ -279,6 +279,7 @@ int main() {
     std::cout << "GPU-only benchmark DONE (" << PREC << ")\n";
     return 0;
 }
+
 
 
 
